@@ -54,7 +54,7 @@ def run_backtest(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, ohlcv: pd
             cfg.execution.signal_timing,
             signal_timing,
         )
-    
+
     df = feats.copy()
 
     # 1. Normalize dataframe to have ticker and date columns
@@ -99,7 +99,7 @@ def run_backtest(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, ohlcv: pd
             "safe_div": safe_div, "zscore": zscore, "delta": delta,
             "rolling_mean": rolling_mean, "rolling_std": rolling_std,
             "rolling_min": rolling_min, "rolling_max": rolling_max,
-            "sign": sign, "abs": abs, "np": np, "clip": clip, 
+            "sign": sign, "abs": abs, "np": np, "clip": clip,
             "log1p": log1p, "shift": shift, "ewm_mean": ewm_mean
         }
 
@@ -134,7 +134,16 @@ def run_backtest(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, ohlcv: pd
     loader = DataLoader(ds, batch_size=512, shuffle=False)
 
     # 4. Generate Predictions
-    device = torch.device("mps" if cfg.model.use_mps_if_available and torch.backends.mps.is_available() else "cpu")
+    # ── FIXED: prefer CUDA (Kaggle/cloud), fall back to MPS (Mac), then CPU ──
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif cfg.model.use_mps_if_available and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    # ─────────────────────────────────────────────────────────────────────────
+    log.info("Inference device: %s", device)
+
     model = model.to(device)
     model.eval()
 
@@ -160,7 +169,7 @@ def run_backtest(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, ohlcv: pd
         }
     )
     pred_df = pred_df.dropna(subset=["execution_date"]).copy()
-    
+
     # Merge predictions with actual price data for simulation
     price_df = raw_price_df.rename(columns={"date": "execution_date"})
     sim_df = pd.merge(pred_df, price_df, on=["ticker", "execution_date"], how="left")
@@ -171,8 +180,7 @@ def run_backtest(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, ohlcv: pd
     capital = cfg.portfolio.capital_inr
     max_slots = cfg.portfolio.max_open_positions
     slot_size = capital * cfg.portfolio.slot_capital_fraction
-    
-    # OPTIMIZED: Widen TP/SL to account for NSE volatility
+
     tp_pct = pct_to_fraction(cfg.label.profit_take_pct)
     sl_pct = pct_to_fraction(cfg.label.stop_loss_pct)
     max_hold_days = max(1, int(cfg.label.horizon_days))
@@ -202,10 +210,10 @@ def run_backtest(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, ohlcv: pd
     entry_day_indices: dict[str, list[int]] = defaultdict(list)
 
     unique_dates = sim_df["execution_date"].unique()
-    
+
     for day_idx, current_date in enumerate(unique_dates):
         day_data = sim_df[sim_df["execution_date"] == current_date]
-        
+
         # A. Check Exits for Open Positions
         surviving_positions = []
         for pos in open_positions:
@@ -214,19 +222,19 @@ def run_backtest(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, ohlcv: pd
             if tkr_data.empty:
                 surviving_positions.append(pos)
                 continue
-                
+
             high = tkr_data["High"].values[0]
             low = tkr_data["Low"].values[0]
             close = tkr_data["Close"].values[0]
-            
+
             entry = pos["entry_price"]
             tp_price = entry * (1 + tp_pct)
             sl_price = entry * (1 - sl_pct)
             pos["days_held"] = int(pos.get("days_held", 0)) + 1
-            
+
             exited = False
             exit_price = 0
-            
+
             if low <= sl_price and high >= tp_price:
                 if stop_first:
                     exited = True
@@ -243,7 +251,7 @@ def run_backtest(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, ohlcv: pd
             elif pos["days_held"] >= max_hold_days:
                 exited = True
                 exit_price = close
-                
+
             if exited:
                 gross_exit = float(pos["shares"] * exit_price)
                 exit_cost = total_cost_one_side(gross_exit, cost_params)
@@ -255,7 +263,7 @@ def run_backtest(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, ohlcv: pd
             else:
                 pos["current_value"] = pos["shares"] * close
                 surviving_positions.append(pos)
-                
+
         open_positions = surviving_positions
 
         # B. Enter New Positions
@@ -269,14 +277,13 @@ def run_backtest(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, ohlcv: pd
             top_candidates = high_conviction_data.sort_values(rank_col, ascending=False).head(cfg.output.signals_top_n)
             day_entries = 0
             max_new = min(int(cfg.portfolio.max_new_positions_per_day), int(cfg.decision.max_picks_per_day))
-            
+
             for _, row in top_candidates.iterrows():
                 if open_slots <= 0:
                     break
                 if day_entries >= max_new:
                     break
-                
-                # Check if already holding
+
                 tkr = str(row["ticker"])
                 if any(p["ticker"] == tkr for p in open_positions):
                     continue
@@ -289,7 +296,7 @@ def run_backtest(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, ohlcv: pd
                     continue
                 if capital < slot_size:
                     break
-                
+
                 entry_price = float(row["Open"])
                 if entry_price <= 0:
                     continue
@@ -322,20 +329,19 @@ def run_backtest(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, ohlcv: pd
     eq_df = pd.DataFrame(equity_curve).set_index("date")
     eq_df["returns"] = eq_df["equity"].pct_change()
     eq_df["drawdown"] = (eq_df["equity"] / eq_df["equity"].cummax()) - 1
-    
+
     total_return = (eq_df["equity"].iloc[-1] / cfg.portfolio.capital_inr) - 1
     max_dd = eq_df["drawdown"].min()
     win_rate = sum(1 for t in trade_log if t["win"]) / max(1, len(trade_log))
     ret_std = eq_df["returns"].std()
     sharpe = (eq_df["returns"].mean() / ret_std) * np.sqrt(252) if len(eq_df) > 1 and ret_std and not np.isnan(ret_std) else 0.0
-    
+
     log.info(f"Backtest Complete. Total Return: {total_return:.2%}, Win Rate: {win_rate:.2%}, Max DD: {max_dd:.2%}, Sharpe: {sharpe:.2f}")
 
     # 7. Save Artifacts
     report_dir = paths.runs / "reports"
     report_dir.mkdir(exist_ok=True)
-    
-    # Save Stats
+
     stats_df = pd.DataFrame([{
         "Total_Return": f"{total_return:.2%}",
         "Win_Rate": f"{win_rate:.2%}",
@@ -350,7 +356,6 @@ def run_backtest(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, ohlcv: pd
     csv_path = report_dir / "backtest_stats.csv"
     stats_df.to_csv(csv_path, index=False)
 
-    # Save Plot (best-effort only; stats are already persisted)
     try:
         import matplotlib.pyplot as plt
         plt.figure(figsize=(10, 5))

@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+
 def predict_proba(model_bundle, X: np.ndarray, use_mps: bool = True) -> np.ndarray:
     """Predict probabilities for a prebuilt window dataset object.
 
@@ -22,22 +23,26 @@ def predict_proba(model_bundle, X: np.ndarray, use_mps: bool = True) -> np.ndarr
     X_scaled = X_scaled.reshape(B, seq_len, num_feats)
 
     # 2. Setup Device
-    device = torch.device("cpu")
-    if use_mps and torch.backends.mps.is_available():
+    # ── FIXED: prefer CUDA (Kaggle/cloud), fall back to MPS (Mac), then CPU ──
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif use_mps and torch.backends.mps.is_available():
         device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    # ─────────────────────────────────────────────────────────────────────────
 
     model.to(device)
     model.eval()
 
     # 3. Create a DataLoader to batch the predictions and avoid OOM
-    # X is now our memory-efficient Dataset, so we pass it directly
-    dataset = X 
-    
+    dataset = X
+
     # Re-inject the scaled data back into the dataset before predicting
     dataset.data_arr = X_scaled
 
-    # Use a small batch size (e.g., 64 or 128) to prevent MPS memory spikes
-    batch_size = 64 
+    # Larger batch size for CUDA; keep small for MPS to prevent memory spikes
+    batch_size = 512 if device.type == "cuda" else 64
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     all_probs = []
@@ -47,11 +52,10 @@ def predict_proba(model_bundle, X: np.ndarray, use_mps: bool = True) -> np.ndarr
         for batch in dataloader:
             xb = batch[0].to(device)
             logit = model(xb).detach().cpu().numpy()
-            
+
             # Convert logits to probabilities using sigmoid
-            # np.exp(logit) / (1 + np.exp(logit)) is the sigmoid function
             prob = 1.0 / (1.0 + np.exp(-logit.squeeze(-1)))
-            
+
             # If the output is a scalar (batch size 1), make it a list
             if prob.ndim == 0:
                 all_probs.append(prob.item())

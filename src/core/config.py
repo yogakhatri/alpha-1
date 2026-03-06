@@ -80,6 +80,8 @@ class ModelCfg(BaseModel):
     max_epochs: int = 30
     early_stop_patience: int = 5
     use_mps_if_available: bool = True
+    # ── ADDED: enables CUDA on Kaggle/cloud; safe to omit from YAML (defaults True) ──
+    use_cuda_if_available: bool = True
 
 
 class WalkForwardCfg(BaseModel):

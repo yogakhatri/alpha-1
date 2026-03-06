@@ -29,8 +29,11 @@ try:
 except ImportError:
     HAS_TQDM = False
 
-if multiprocessing.get_start_method(allow_none=True) != "spawn":
-    multiprocessing.set_start_method("spawn", force=True)
+# ── FIXED: only force spawn on macOS; Linux (Kaggle) works best with fork ──
+if multiprocessing.get_start_method(allow_none=True) is None:
+    _default_method = "spawn" if os.uname().sysname == "Darwin" else "fork"
+    multiprocessing.set_start_method(_default_method, force=True)
+# ───────────────────────────────────────────────────────────────────────────
 
 NUM_PHYSICAL_CORES = multiprocessing.cpu_count()
 torch.set_num_threads(NUM_PHYSICAL_CORES)
@@ -42,24 +45,26 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = str(NUM_PHYSICAL_CORES)
 
 
 # ---------------------------------------------------------------------------
-# Device helpers                                                  ← CUDA
+# Device helpers
 # ---------------------------------------------------------------------------
 
 def get_device(cfg: AppConfig) -> torch.device:
     """Resolve training device: CUDA > MPS > CPU."""
-    if getattr(cfg.model, "use_cuda_if_available", False) and torch.cuda.is_available():
+    # ── FIXED: default use_cuda_if_available to True so CUDA is auto-used ──
+    if getattr(cfg.model, "use_cuda_if_available", True) and torch.cuda.is_available():
         return torch.device("cuda")
-    if getattr(cfg.model, "use_mps_if_available", False) and torch.backends.mps.is_available():
+    if getattr(cfg.model, "use_mps_if_available", True) and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+    # ────────────────────────────────────────────────────────────────────────
 
 
 def _pin_memory_for(device: torch.device) -> bool:
-    """pin_memory is only beneficial (and safe) with CUDA."""   # ← CUDA
+    """pin_memory is only beneficial (and safe) with CUDA."""
     return device.type == "cuda"
 
 
-def _make_amp_handles(device: torch.device):                    # ← CUDA
+def _make_amp_handles(device: torch.device):
     """
     Return (autocast_ctx_fn, scaler_or_None) for the given device.
 
@@ -285,7 +290,7 @@ def _to_loader(
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=0,
-        pin_memory=pin_memory,      # ← CUDA
+        pin_memory=pin_memory,
     )
 
 
@@ -303,24 +308,26 @@ def _predict_scores(
     if len(X) == 0:
         return np.empty((0,), dtype=np.float32)
 
-    pin_memory = _pin_memory_for(device)                        # ← CUDA
-    autocast_fn, _ = _make_amp_context(device)                 # ← CUDA: reuse AMP ctx for inference
+    pin_memory = _pin_memory_for(device)
+    # ── FIXED: was incorrectly calling _make_amp_context (does not exist) ──
+    autocast_fn, _ = _make_amp_handles(device)
+    # ────────────────────────────────────────────────────────────────────────
 
     loader = DataLoader(
         TensorDataset(torch.tensor(X, dtype=torch.float32)),
         batch_size=batch_size,
         shuffle=False,
         num_workers=0,
-        pin_memory=pin_memory,                                  # ← CUDA
+        pin_memory=pin_memory,
     )
     out: list[float] = []
     model.eval()
     with torch.no_grad():
         for (bx,) in loader:
-            bx = bx.to(device, non_blocking=pin_memory)        # ← CUDA: async transfer
-            with autocast_fn():                                 # ← CUDA: float16 inference
+            bx = bx.to(device, non_blocking=pin_memory)
+            with autocast_fn():
                 logits = model(bx)
-            probs = torch.sigmoid(logits).float().cpu().numpy().reshape(-1)  # ← CUDA: cast back to float32
+            probs = torch.sigmoid(logits).float().cpu().numpy().reshape(-1)
             out.extend(probs.tolist())
     return np.asarray(out, dtype=np.float32)
 
@@ -377,8 +384,8 @@ def _train_fold_model(
     pos_weight = torch.tensor([_compute_pos_weight(y_train)], dtype=torch.float32, device=device)
     criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    pin_memory   = _pin_memory_for(device)                     # ← CUDA
-    autocast_fn, scaler = _make_amp_handles(device)            # ← CUDA
+    pin_memory   = _pin_memory_for(device)
+    autocast_fn, scaler = _make_amp_handles(device)
 
     loader     = _to_loader(X_train, y_train, cfg.model.batch_size, shuffle=True,  pin_memory=pin_memory)
     val_loader = _to_loader(X_val,   y_val,   cfg.model.batch_size, shuffle=False, pin_memory=pin_memory)
@@ -399,15 +406,15 @@ def _train_fold_model(
         n_batches  = 0
 
         for bx, by in loader:
-            bx = bx.to(device, non_blocking=pin_memory)        # ← CUDA: async H→D
-            by = by.to(device, non_blocking=pin_memory)        # ← CUDA
+            bx = bx.to(device, non_blocking=pin_memory)
+            by = by.to(device, non_blocking=pin_memory)
             optimizer.zero_grad()
 
-            with autocast_fn():                                 # ← CUDA: float16 fwd pass
+            with autocast_fn():
                 logits = model(bx)
                 loss   = criterion(logits, by)
 
-            if scaler is not None:                             # ← CUDA: scaled backward
+            if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -428,7 +435,7 @@ def _train_fold_model(
             for bx, by in val_loader:
                 bx = bx.to(device, non_blocking=pin_memory)
                 by = by.to(device, non_blocking=pin_memory)
-                with autocast_fn():                             # ← CUDA
+                with autocast_fn():
                     logits = model(bx)
                     loss   = criterion(logits, by)
                 bs = int(by.shape[0])
@@ -541,14 +548,12 @@ def train_walk_forward(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, alp
         raise ValueError("Not enough history for configured walk-forward windows.")
     log.info("[3/6] Walk-forward folds: %s", len(splits))
 
-    # ── Device selection: CUDA > MPS > CPU ──────────────────────────────── ← CUDA
     device = get_device(cfg)
     log.info("Training device: %s", device)
     if device.type == "cuda":
         log.info("  CUDA device: %s | VRAM: %.1f GB",
                  torch.cuda.get_device_name(0),
                  torch.cuda.get_device_properties(0).total_memory / 1e9)
-    # ────────────────────────────────────────────────────────────────────────
 
     oos_rows:    list[pd.DataFrame]       = []
     fold_rows:   list[dict]               = []
@@ -596,13 +601,13 @@ def train_walk_forward(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, alp
         test_top2   = _daily_topk_precision(test_dates, test_scores, y_test, k=2)
 
         fold_rows.append({
-            "fold":                  i,
-            "train_windows":         int(len(X_train)),
-            "val_windows":           int(len(X_val)),
-            "test_windows":          int(len(X_test)),
-            "val_top1_precision":    float(best_stats["val_top1_precision"]),
-            "val_loss":              float(best_stats["val_loss"]),
-            "test_top1_precision":   float(test_top1),
+            "fold":                     i,
+            "train_windows":            int(len(X_train)),
+            "val_windows":              int(len(X_val)),
+            "test_windows":             int(len(X_test)),
+            "val_top1_precision":       float(best_stats["val_top1_precision"]),
+            "val_loss":                 float(best_stats["val_loss"]),
+            "test_top1_precision":      float(test_top1),
             "test_top2_pick_precision": float(test_top2),
         })
 

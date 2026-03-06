@@ -96,10 +96,6 @@ def generate_daily_signals(
 
     # ---------------------------------------------------------------
     # 3) Compute LLM alphas dynamically on latest_df
-    #    FIX: to_series() ensures numpy arrays from intermediate ops
-    #    (e.g. np.log(Close)) are re-wrapped as pd.Series before any
-    #    groupby-based rolling helper is called — preventing the
-    #    "'numpy.ndarray' object has no attribute 'groupby'" warnings.
     # ---------------------------------------------------------------
     if alpha_lib and hasattr(alpha_lib, "formulas") and alpha_lib.formulas:
         log.info("Computing LLM alphas dynamically for inference...")
@@ -173,7 +169,7 @@ def generate_daily_signals(
 
         for alpha_name, formula in alpha_lib.formulas.items():
             if alpha_name in latest_df.columns:
-                continue  # already present, skip
+                continue
 
             eval_locals = {
                 col: latest_df[col]
@@ -181,7 +177,6 @@ def generate_daily_signals(
                 if col not in ("ticker", "date")
             }
 
-            # Explicitly expose OHLCV with canonical casing
             for canonical in ("Open", "High", "Low", "Close", "Volume"):
                 if canonical in latest_df.columns:
                     eval_locals[canonical] = latest_df[canonical]
@@ -257,10 +252,15 @@ def generate_daily_signals(
 
     # ---------------------------------------------------------------
     # 5) Inference
-    # ---------------------------------------------------------------
-    device = torch.device("cpu")
-    if cfg.model.use_mps_if_available and torch.backends.mps.is_available():
+    # ── FIXED: prefer CUDA (Kaggle/cloud), fall back to MPS (Mac), then CPU ──
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif cfg.model.use_mps_if_available and torch.backends.mps.is_available():
         device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    # ────────────────────────────────────────────────────────────────────────
+    log.info("Inference device: %s", device)
 
     model = model.to(device)
     model.eval()
@@ -321,9 +321,6 @@ def generate_daily_signals(
     if filtered.empty:
         filtered = results_df.sort_values(rank_col, ascending=False).head(0).copy()
 
-    # Create a deterministic date key for this signal batch.
-    # Prefer execution date if available, else prediction date, else "today"
-    # in project timezone. This guarantees unique per-date filenames.
     if not filtered.empty:
         date_source = filtered["execution_date"].dropna()
         if date_source.empty:
@@ -340,9 +337,6 @@ def generate_daily_signals(
     dated_csv = paths.signals_csv_path_for_date(signal_date)
     latest_csv = paths.signals_csv_path()
 
-    # Write both files:
-    # - dated snapshot for historical traceability
-    # - stable latest file for downstream consumers
     filtered.to_csv(str(dated_csv), index=False)
     filtered.to_csv(str(latest_csv), index=False)
 

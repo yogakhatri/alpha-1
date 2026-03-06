@@ -1,9 +1,0 @@
-{
-  "method": "platt",
-  "coef": 3.2579330231142003,
-  "intercept": -3.510458484071918,
-  "top1_threshold": 0.21877796759186383,
-  "top1_threshold_days": 56,
-  "top1_threshold_precision": 0.19642857142857142,
-  "signal_timing": "EOD_NEXT_OPEN"
-}

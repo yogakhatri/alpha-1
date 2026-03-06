@@ -1,0 +1,96 @@
+project:
+  run_name: "nse_swing_v1_optimized"
+  timezone: "Asia/Kolkata"
+  seed: 42
+
+universe:
+  tickers_file: "data/raw/nifty500_tickers.txt"
+  min_price: 50.0
+  min_median_turnover_20d: 20000000.0
+
+data:
+  start_date: "2018-01-01"
+  end_date: "2026-03-05"
+  use_bhavcopy: true
+  use_yfinance_fallback: true
+  max_stale_trading_days: 5
+
+label:
+  horizon_days: 5
+  profit_take_pct: 0.06
+  stop_loss_pct: 0.03
+  same_day_both_hit_rule: "STOP_FIRST"
+
+features:
+  lookback_days_for_model: 60      # Increased to catch full quarter cycles
+  compute_indicators: true
+
+llm_alpha:
+  enabled: true
+  k_alphas: 20                     # Maximize feature engineering
+  max_expr_chars: 200
+  max_rolling_window: 60
+  provider: "manual"
+  cache_dir: "data/runs/alpha_cache"
+  openai_compatible:
+    base_url: "https://api.openai.com"
+    model: "gpt-4.1-mini"
+    api_key_env: "OPENAI_API_KEY"
+
+model:
+  d_model: 64                      # Increased width to capture 35+ features
+  n_heads: 4
+  n_layers: 3                      # Deeper network for time-series patterns
+  dropout: 0.2                     # Increased to combat overfitting
+  lr: 0.0003                       # Slightly lowered for smoother convergence
+  weight_decay: 0.05               # Increased L2 penalty for better generalization
+  batch_size: 256                  # High batch size stabilizes gradients
+  max_epochs: 30                   # Let it train until early stopping kicks in
+  early_stop_patience: 7           # Forgiving early stop for volatile datasets
+  use_cuda_if_available: true       # Check CUDA (Nvidia GPU) first
+  use_mps_if_available: true
+
+backtest:
+  walk_forward:
+    train_days: 756                # Train on ~3 years
+    val_days: 63                   # Validate on ~3 months
+    test_days: 63                  # Test on ~3 months
+    step_days: 21                  # Roll forward by ~1 month
+    max_folds: 8
+
+execution:
+  signal_timing: "EOD_NEXT_OPEN"
+
+decision:
+  max_picks_per_day: 2
+  min_score_threshold: 0.0
+  min_calibrated_prob: 0.0
+  min_expected_value_pct: 0.0
+  rank_by: "expected_value"
+  target_top1_precision: 0.30
+  min_days_for_threshold: 30
+  max_reentries_per_ticker_20d: 2
+  reentry_cooldown_days: 3
+  no_trade_if_below_threshold: true
+
+portfolio:
+  capital_inr: 100000
+  max_open_positions: 5
+  max_new_positions_per_day: 2
+  risk_per_trade_pct: 0.005
+  slot_capital_fraction: 0.20
+
+costs:
+  slippage_bps_per_side: 15
+  regulatory_bps_per_side: 5
+  groww_brokerage:
+    enabled: true
+
+monitoring:
+  rolling_short_days: 20
+  rolling_long_days: 60
+  drift_alert_drop: 0.08
+
+output:
+  runs_dir: "data/runs"
+  signals_top_n: 10

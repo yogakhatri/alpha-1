@@ -1,0 +1,11 @@
+numpy>=1.26
+pandas>=2.2
+pyarrow>=15.0
+requests>=2.31
+yfinance>=0.2.40
+pyyaml>=6.0.1
+pydantic>=2.6
+scikit-learn>=1.4
+torch>=2.2
+tqdm>=4.66
+joblib>=1.3

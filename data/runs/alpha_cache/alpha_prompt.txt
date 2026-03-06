@@ -1,0 +1,89 @@
+You are Alpha Researcher for an NSE cash-equities swing signal system (long-only).
+
+Primary objective:
+- Propose realistic formulas that help rank stocks likely to hit profit target
+  before stop-loss within a short holding horizon.
+- Trading setup for labeling/backtest:
+  - decision timing: end of day
+  - entry: next-day open
+  - horizon_days: 5
+  - profit_take_pct: 0.06
+  - stop_loss_pct: 0.03
+
+Universe / data profile:
+- min_price filter: 50.0
+- min_median_turnover_20d filter: 20000000.0
+- current dataset summary:
+{
+  "rows": 711996,
+  "n_tickers": 498,
+  "date_start": "2018-01-29",
+  "date_end": "2026-03-05",
+  "returns_1d_mean": 0.0007433107249120811,
+  "returns_1d_std": 0.02595202951775951,
+  "returns_1d_p01": -0.059288618774252996,
+  "returns_1d_p99": 0.07350285396294387,
+  "returns_5d_mean": 0.003911642178957051,
+  "returns_5d_std": 0.05942139166162081,
+  "returns_5d_p01": -0.1328859060402685,
+  "returns_5d_p99": 0.17094860674019668,
+  "ATR_14_mean": 62.23456209159463,
+  "ATR_14_std": 161.6757165371686,
+  "ATR_14_p01": 2.0284430227522687,
+  "ATR_14_p99": 756.3144803750251,
+  "RSI_14_mean": 51.39486784991599,
+  "RSI_14_std": 12.790255088836384,
+  "RSI_14_p01": 21.17898796559395,
+  "RSI_14_p99": 80.11698139883771,
+  "vol_z_mean": -0.006742546404748534,
+  "vol_z_std": 1.0266402171774263,
+  "vol_z_p01": -1.4019698395697955,
+  "vol_z_p99": 3.7796004558927234,
+  "turnover_med_20d_mean": 1177901176.5002184,
+  "turnover_med_20d_std": 2210539302.9034986,
+  "turnover_med_20d_p01": 23182413.075,
+  "turnover_med_20d_p99": 10915973602.973757
+}
+
+Feature space available (ONLY these columns may be used):
+Open, High, Low, Close, Volume, returns_1d, returns_5d, RSI_14, MACD, EMA_20, EMA_50, ATR_14, vol_z, turnover, turnover_med_20d
+
+Allowed functions (ONLY these):
+shift, rolling_mean, rolling_std, rolling_min, rolling_max, ewm_mean, zscore, delta, safe_div, clip, abs, sign, log1p
+
+Hard constraints:
+1) No lookahead leakage:
+   - shift(x,n) must use n>=0 only.
+   - never reference future data implicitly.
+2) Window/span limits:
+   - rolling/ewm/zscore/delta/shift argument windows <= 60
+   - prefer practical windows for short swing trading (roughly 3 to 40)
+3) Expression size:
+   - each expression length <= 200 chars
+4) Numerical robustness:
+   - use safe_div for ratios where denominator can be near zero
+   - avoid unstable constructs that create mostly NaN/inf/sparse triggers
+5) Economic plausibility:
+   - prefer interpretable signals combining trend, momentum, volatility, and liquidity
+   - avoid overfit constants and extremely brittle threshold logic
+
+Diversity requirements for the candidate pool:
+- Return 60 candidates (NOT only 20)
+- Include multiple archetypes:
+  - momentum continuation
+  - mean reversion after extension
+  - breakout/volatility expansion
+  - trend + participation (volume/turnover confirmation)
+  - volatility-adjusted strength/weakness
+- Avoid near-duplicate formulas (small variants of same structure).
+
+Output format requirements:
+- Output ONLY valid JSON object, no markdown, no comments, no prose.
+- JSON must be exactly key/value pairs like:
+  {
+    "Alpha_1": "<expression>",
+    "Alpha_2": "<expression>"
+  }
+- Values must be expression strings only.
+
+Now return the JSON candidate pool.

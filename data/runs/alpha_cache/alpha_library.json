@@ -1,0 +1,43 @@
+{
+  "k": 20,
+  "feature_names": [
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Volume",
+    "returns_1d",
+    "returns_5d",
+    "RSI_14",
+    "MACD",
+    "EMA_20",
+    "EMA_50",
+    "ATR_14",
+    "vol_z",
+    "turnover",
+    "turnover_med_20d"
+  ],
+  "formulas": {
+    "Alpha_1": "rolling_mean(returns_1d * vol_z, 10)",
+    "Alpha_2": "delta(rolling_mean(returns_1d, 5), 5) * sign(delta(rolling_mean(Volume, 5), 5))",
+    "Alpha_3": "(-1.0*(-(returns_5d) * clip(sign(Close - EMA_50), 0, 1)))",
+    "Alpha_4": "(-1.0*(-(returns_1d) * clip(sign(Close - EMA_50), 0, 1)))",
+    "Alpha_5": "rolling_mean(log1p(returns_1d), 5)",
+    "Alpha_6": "ewm_mean(returns_1d * clip(sign(turnover - turnover_med_20d), 0, 1), 10)",
+    "Alpha_7": "ewm_mean(returns_1d, 5)",
+    "Alpha_8": "(-1.0*(safe_div(EMA_20 - Close, EMA_20) * clip(sign(EMA_20 - EMA_50), 0, 1)))",
+    "Alpha_9": "-(ewm_mean(returns_1d, 5)) * clip(sign(rolling_mean(returns_1d, 20)), 0, 1)",
+    "Alpha_10": "safe_div(turnover, turnover_med_20d) * clip(sign(returns_1d), 0, 1)",
+    "Alpha_11": "sign(Close - EMA_20) * log1p(safe_div(turnover, turnover_med_20d))",
+    "Alpha_12": "safe_div(turnover, turnover_med_20d) * sign(Close - EMA_50) * clip(sign(delta(EMA_20, 5)), 0, 1)",
+    "Alpha_13": "(-1.0*(delta(rolling_mean(returns_1d, 3), 3)))",
+    "Alpha_14": "clip(sign(Close - rolling_max(shift(Close, 1), 15)), 0, 1) * vol_z",
+    "Alpha_15": "delta(log1p(safe_div(turnover, turnover_med_20d)), 5)",
+    "Alpha_16": "vol_z * clip(sign(Close - rolling_max(shift(Close, 1), 10)), 0, 1)",
+    "Alpha_17": "vol_z * safe_div(Close - Open, ATR_14)",
+    "Alpha_18": "vol_z * clip(sign(Close - EMA_20), 0, 1)",
+    "Alpha_19": "zscore(turnover, 20) * sign(returns_5d)",
+    "Alpha_20": "(-1.0*(delta(RSI_14, 5) * clip(sign(RSI_14 - 50), 0, 1)))"
+  },
+  "provider": "manual"
+}

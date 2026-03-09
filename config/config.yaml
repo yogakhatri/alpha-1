@@ -10,7 +10,7 @@ universe:
 
 data:
   start_date: "2018-01-01"
-  end_date: "2026-03-05"
+  end_date: "2026-03-09"
   use_bhavcopy: true
   use_yfinance_fallback: true
   max_stale_trading_days: 5

@@ -16,9 +16,10 @@ class TimeSeriesWindowDataset(Dataset):
         self.feature_cols = feature_cols
         self.label_col = label_col
 
-        # ── FIX: Sort by ticker first to guarantee contiguous ticker blocks ──
+        # Sort by ticker and date to guarantee contiguous, chronological ticker blocks
         if 'ticker' in df.columns:
-            df = df.sort_values('ticker', kind='stable').reset_index(drop=True)
+            sort_cols = ['ticker', 'date'] if 'date' in df.columns else ['ticker']
+            df = df.sort_values(sort_cols, kind='stable').reset_index(drop=True)
 
         # Store raw data as contiguous NumPy arrays (fast random access)
         self.data_arr  = df[feature_cols].to_numpy(dtype=np.float32)

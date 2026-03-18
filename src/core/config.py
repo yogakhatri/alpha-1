@@ -30,7 +30,7 @@ class UniverseCfg(BaseModel):
 class DataCfg(BaseModel):
     """Raw data download/date range settings."""
     start_date: str
-    end_date: str
+    end_date: str = ""  # Empty string means "use today's date"
     use_bhavcopy: bool = True
     use_yfinance_fallback: bool = True
     max_stale_trading_days: int = 5
@@ -80,8 +80,8 @@ class ModelCfg(BaseModel):
     max_epochs: int = 30
     early_stop_patience: int = 5
     use_mps_if_available: bool = True
-    # ── ADDED: enables CUDA on Kaggle/cloud; safe to omit from YAML (defaults True) ──
     use_cuda_if_available: bool = True
+    torch_compile: bool = True          # torch.compile for PyTorch 2+ speed-up
 
 
 class WalkForwardCfg(BaseModel):
@@ -170,9 +170,19 @@ class AppConfig(BaseModel):
 
 
 def load_config(path: str) -> AppConfig:
-    """Load YAML config and validate it against AppConfig schema."""
+    """Load YAML config and validate it against AppConfig schema.
+
+    If data.end_date is empty or 'today', it is replaced with today's date.
+    """
+    import datetime
     p = Path(path)
     obj = yaml.safe_load(p.read_text())
+    # Dynamic end_date: use today if not explicitly set
+    data_cfg = obj.get("data", {})
+    end = data_cfg.get("end_date", "")
+    if not end or str(end).strip().lower() == "today":
+        data_cfg["end_date"] = datetime.date.today().isoformat()
+        obj["data"] = data_cfg
     return AppConfig.model_validate(obj)
 
 

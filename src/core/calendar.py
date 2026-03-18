@@ -3,18 +3,45 @@ from __future__ import annotations
 """Trading-day helpers used by data download and labeling logic."""
 
 import pandas as pd
+from pandas.tseries.holiday import AbstractHolidayCalendar, Holiday, nearest_workday
+from pandas.tseries.offsets import CustomBusinessDay
+
+
+# Major NSE holidays (fixed-date; movable ones like Diwali are approximated)
+# These cover Republic Day, Independence Day, Gandhi Jayanti, Christmas, etc.
+# Movable holidays (Holi, Diwali, Eid, etc.) change yearly but skipping them
+# is harmless — bhavcopy download will simply get a 404 and move on.
+_NSE_FIXED_HOLIDAYS = [
+    Holiday("Republic Day", month=1, day=26),
+    Holiday("Independence Day", month=8, day=15),
+    Holiday("Gandhi Jayanti", month=10, day=2),
+    Holiday("Christmas", month=12, day=25),
+    Holiday("May Day", month=5, day=1),
+]
+
+
+class NSEHolidayCalendar(AbstractHolidayCalendar):
+    rules = _NSE_FIXED_HOLIDAYS
+
+
+_NSE_BDAY = CustomBusinessDay(calendar=NSEHolidayCalendar())
 
 
 def trading_days_between(start: str, end: str) -> pd.DatetimeIndex:
-    """Return business-day index between two dates.
+    """Return approximate NSE trading-day index between two dates.
 
-    Note:
-        This is a pragmatic approximation for NSE trading sessions. Exchange
-        holidays are naturally handled by missing market data downstream.
+    Uses weekday exclusion + known fixed NSE holidays. Movable holidays
+    (Diwali, Holi, Eid) are not modeled — missing bhavcopy for those
+    days is handled gracefully downstream.
     """
-    # Minimal: business days. For v1 we accept that some NSE holidays will be included;
-    # missing bhavcopy rows will naturally drop those days.
-    return pd.bdate_range(start=start, end=end, tz=None)
+    return pd.date_range(start=start, end=end, freq=_NSE_BDAY)
+
+
+def nse_business_day_count(start: pd.Timestamp, end: pd.Timestamp) -> int:
+    """Count approximate NSE trading days between two dates."""
+    if start >= end:
+        return 0
+    return len(pd.date_range(start=start + _NSE_BDAY, end=end, freq=_NSE_BDAY))
 
 
 def next_trading_day(d: pd.Timestamp, all_days: pd.DatetimeIndex) -> pd.Timestamp:

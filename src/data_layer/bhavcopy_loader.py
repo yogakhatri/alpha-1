@@ -3,6 +3,7 @@ from __future__ import annotations
 """Primary NSE bhavcopy ingestion and normalization utilities."""
 
 import io
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,33 @@ from src.core.logging import get_logger
 from src.core.paths import RunPaths
 
 log = get_logger(__name__)
+
+# Persistent session with NSE-compatible headers (avoids HTTP 403)
+_SESSION: requests.Session | None = None
+
+
+def _get_nse_session() -> requests.Session:
+    """Return a reusable requests.Session with NSE-friendly headers & cookies."""
+    global _SESSION
+    if _SESSION is not None:
+        return _SESSION
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/",
+        "Connection": "keep-alive",
+    })
+    # Hit the NSE homepage to get a valid session cookie
+    try:
+        s.get("https://www.nseindia.com/", timeout=15)
+    except Exception:
+        pass  # Proceed anyway; some archive URLs work without cookies
+    _SESSION = s
+    return s
 
 
 @dataclass(frozen=True)
@@ -42,19 +70,15 @@ def _candidate_urls(day: pd.Timestamp) -> list[BhavcopyURL]:
 
 
 def _http_get(url: str) -> bytes:
-    """Perform HTTP GET with browser-like headers."""
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "*/*",
-        "Connection": "keep-alive",
-    }
-    r = requests.get(url, headers=headers, timeout=30)
+    """Perform HTTP GET using the NSE session with browser-like headers."""
+    session = _get_nse_session()
+    r = session.get(url, timeout=30)
     r.raise_for_status()
     return r.content
 
 
 def download_bhavcopy_range(cfg: AppConfig, paths: RunPaths) -> None:
-    """Download bhavcopy zip files for configured date range."""
+    """Download bhavcopy zip files for configured date range with rate limiting."""
     days = trading_days_between(cfg.data.start_date, cfg.data.end_date)
     out_dir = paths.raw / "bhavcopy"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -74,6 +98,9 @@ def download_bhavcopy_range(cfg: AppConfig, paths: RunPaths) -> None:
                 break
             except Exception:
                 continue
+
+        # Rate limiting: 0.5s between requests to avoid IP blocking
+        time.sleep(0.5)
 
         if not ok:
             # not fatal: holiday/missing day

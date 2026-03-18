@@ -122,7 +122,7 @@ def download_yfinance_range(cfg: AppConfig, paths: RunPaths, tickers: list[str])
             tickers=t,
             start=cfg.data.start_date,
             end=cfg.data.end_date,
-            auto_adjust=False,
+            auto_adjust=True,
             progress=False,
         )
         norm = _normalize_yfinance_frame(raw, ticker=t)

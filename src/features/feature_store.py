@@ -63,4 +63,11 @@ def build_feature_table(cfg: AppConfig, ohlcv: pd.DataFrame) -> pd.DataFrame:
     if cfg.universe.min_median_turnover_20d > 0:
         feats = feats[feats["turnover_med_20d"] >= float(cfg.universe.min_median_turnover_20d)].copy()
 
+    # Store barrier label alongside features for data quality inspection
+    from src.backtest.simulator import add_label_column_barrier
+    try:
+        feats = add_label_column_barrier(cfg, feats)
+    except Exception:
+        pass  # Non-fatal: label is recomputed during training anyway
+
     return validate_features(feats)

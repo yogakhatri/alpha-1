@@ -1,12 +1,8 @@
 from __future__ import annotations
 """Walk-forward model training, OOS scoring, calibration, and monitoring."""
 
-import contextlib
 import copy
 import json
-import multiprocessing
-import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -17,6 +13,17 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from src.backtest.simulator import add_label_column_barrier
 from src.core.config import AppConfig
+from src.core.device import (
+    inference_context,
+    log_device_info,
+    make_amp_context,
+    optimal_batch_size,
+    optimal_num_workers,
+    pin_memory_for,
+    resolve_device,
+    try_compile,
+    tune_for_device,
+)
 from src.core.paths import RunPaths
 from src.core.seed import seed_everything
 from src.models.calibration import apply_calibration, build_thresholds_from_oos, fit_platt_calibrator
@@ -29,56 +36,19 @@ try:
 except ImportError:
     HAS_TQDM = False
 
-# ── FIXED: only force spawn on macOS; Linux (Kaggle) works best with fork ──
-if multiprocessing.get_start_method(allow_none=True) is None:
-    _default_method = "spawn" if os.uname().sysname == "Darwin" else "fork"
-    multiprocessing.set_start_method(_default_method, force=True)
-# ───────────────────────────────────────────────────────────────────────────
-
-NUM_PHYSICAL_CORES = multiprocessing.cpu_count()
-torch.set_num_threads(NUM_PHYSICAL_CORES)
-torch.set_num_interop_threads(NUM_PHYSICAL_CORES)
-os.environ["OMP_NUM_THREADS"] = str(NUM_PHYSICAL_CORES)
-os.environ["MKL_NUM_THREADS"] = str(NUM_PHYSICAL_CORES)
-os.environ["OPENBLAS_NUM_THREADS"] = str(NUM_PHYSICAL_CORES)
-os.environ["VECLIB_MAXIMUM_THREADS"] = str(NUM_PHYSICAL_CORES)
-
 
 # ---------------------------------------------------------------------------
-# Device helpers
+# Device helpers (delegated to src.core.device)
 # ---------------------------------------------------------------------------
 
 def get_device(cfg: AppConfig) -> torch.device:
     """Resolve training device: CUDA > MPS > CPU."""
-    # ── FIXED: default use_cuda_if_available to True so CUDA is auto-used ──
-    if getattr(cfg.model, "use_cuda_if_available", True) and torch.cuda.is_available():
-        return torch.device("cuda")
-    if getattr(cfg.model, "use_mps_if_available", True) and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-    # ────────────────────────────────────────────────────────────────────────
-
-
-def _pin_memory_for(device: torch.device) -> bool:
-    """pin_memory is only beneficial (and safe) with CUDA."""
-    return device.type == "cuda"
-
-
-def _make_amp_handles(device: torch.device):
-    """
-    Return (autocast_ctx_fn, scaler_or_None) for the given device.
-
-    - CUDA  → torch.amp.autocast(float16) + GradScaler
-    - MPS   → nullcontext + no scaler  (MPS autocast is still experimental)
-    - CPU   → nullcontext + no scaler
-    """
-    if device.type == "cuda":
-        autocast_fn = lambda: torch.amp.autocast(device_type="cuda", dtype=torch.float16)
-        scaler = torch.amp.GradScaler("cuda")
-    else:
-        autocast_fn = contextlib.nullcontext
-        scaler = None
-    return autocast_fn, scaler
+    device = resolve_device(
+        prefer_cuda=getattr(cfg.model, "use_cuda_if_available", True),
+        prefer_mps=getattr(cfg.model, "use_mps_if_available", True),
+    )
+    tune_for_device(device)
+    return device
 
 
 # ---------------------------------------------------------------------------
@@ -93,86 +63,6 @@ class ModelBundle:
         self.feature_cols = feature_cols
         self.lookback = lookback
         self.signal_timing = signal_timing
-
-
-# ---------------------------------------------------------------------------
-# Alpha computation
-# ---------------------------------------------------------------------------
-
-def _compute_single_alpha(args):
-    """Evaluate one alpha expression on provided feature payload."""
-    alpha_name, formula, feats_dict, index, group_col_values = args
-    feats = pd.DataFrame(feats_dict, index=index)
-    group_col = pd.Series(group_col_values, index=index) if group_col_values is not None else None
-
-    def apply_grouped(s, func):
-        if group_col is not None:
-            return s.groupby(group_col).transform(func)
-        return func(s)
-
-    def _to_series(x, ref=None):
-        if isinstance(x, pd.Series):
-            return x
-        if ref is not None and isinstance(ref, pd.Series):
-            return pd.Series(x, index=ref.index)
-        return pd.Series(x, index=feats.index)
-
-    def safe_div(x, y):
-        x, y = _to_series(x), _to_series(y)
-        return x.div(y.replace(0, np.nan)).fillna(0.0)
-
-    def zscore(x, w):
-        s = _to_series(x)
-        mean = apply_grouped(s, lambda col: col.rolling(int(w)).mean())
-        std  = apply_grouped(s, lambda col: col.rolling(int(w)).std())
-        return (s - mean).div(std.replace(0, np.nan)).fillna(0.0)
-
-    def delta(x, p):
-        return apply_grouped(_to_series(x), lambda col: col.diff(int(p)))
-
-    def rolling_mean(x, w):
-        return apply_grouped(_to_series(x), lambda col: col.rolling(int(w)).mean())
-
-    def rolling_std(x, w):
-        return apply_grouped(_to_series(x), lambda col: col.rolling(int(w)).std()).fillna(0.0)
-
-    def rolling_min(x, w):
-        return apply_grouped(_to_series(x), lambda col: col.rolling(int(w)).min())
-
-    def rolling_max(x, w):
-        return apply_grouped(_to_series(x), lambda col: col.rolling(int(w)).max())
-
-    def ewm_mean(x, span):
-        return apply_grouped(_to_series(x), lambda col: col.ewm(span=int(span)).mean())
-
-    def sign(x):
-        s = _to_series(x)
-        return pd.Series(np.sign(s.values), index=s.index)
-
-    def clip(x, lo, hi):
-        return _to_series(x).clip(lower=lo, upper=hi)
-
-    def log1p(x):
-        s = _to_series(x)
-        return pd.Series(np.log1p(s.values), index=s.index)
-
-    def shift(x, d):
-        return apply_grouped(_to_series(x), lambda col: col.shift(int(d)))
-
-    eval_globals = {
-        "safe_div": safe_div, "zscore": zscore, "delta": delta,
-        "rolling_mean": rolling_mean, "rolling_std": rolling_std,
-        "rolling_min": rolling_min, "rolling_max": rolling_max,
-        "sign": sign, "abs": lambda x: _to_series(x).abs(),
-        "np": np, "clip": clip, "log1p": log1p,
-        "shift": shift, "ewm_mean": ewm_mean,
-    }
-    try:
-        result = eval(formula, eval_globals, {col: feats[col] for col in feats.columns})
-        vals = result.values if isinstance(result, pd.Series) else np.array(result)
-        return alpha_name, vals, None
-    except Exception as e:
-        return alpha_name, None, str(e)
 
 
 # ---------------------------------------------------------------------------
@@ -278,19 +168,22 @@ def _to_loader(
     y: np.ndarray,
     batch_size: int,
     shuffle: bool,
-    pin_memory: bool = False,       # ← CUDA: True only when device is CUDA
+    device: torch.device | None = None,
 ) -> DataLoader:
-    """Wrap NumPy arrays into a torch DataLoader."""
+    """Wrap NumPy arrays into a torch DataLoader with device-optimal settings."""
     ds = TensorDataset(
         torch.tensor(X, dtype=torch.float32),
         torch.tensor(y.reshape(-1, 1), dtype=torch.float32),
     )
+    nw = optimal_num_workers(device) if device is not None else 0
+    pm = pin_memory_for(device) if device is not None else False
     return DataLoader(
         ds,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=0,
-        pin_memory=pin_memory,
+        num_workers=nw,
+        pin_memory=pm,
+        persistent_workers=(nw > 0),
     )
 
 
@@ -302,29 +195,31 @@ def _predict_scores(
     model: nn.Module,
     X: np.ndarray,
     device: torch.device,
-    batch_size: int = 1024,
+    batch_size: int | None = None,
 ) -> np.ndarray:
     """Run batched inference and return sigmoid scores."""
     if len(X) == 0:
         return np.empty((0,), dtype=np.float32)
 
-    pin_memory = _pin_memory_for(device)
-    # ── FIXED: was incorrectly calling _make_amp_context (does not exist) ──
-    autocast_fn, _ = _make_amp_handles(device)
-    # ────────────────────────────────────────────────────────────────────────
+    pm = pin_memory_for(device)
+    autocast_fn, _ = make_amp_context(device)
+    if batch_size is None:
+        batch_size = optimal_batch_size(device)["inference"]
+    nw = optimal_num_workers(device)
 
     loader = DataLoader(
         TensorDataset(torch.tensor(X, dtype=torch.float32)),
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
-        pin_memory=pin_memory,
+        num_workers=nw,
+        pin_memory=pm,
+        persistent_workers=(nw > 0),
     )
     out: list[float] = []
     model.eval()
-    with torch.no_grad():
+    with inference_context():
         for (bx,) in loader:
-            bx = bx.to(device, non_blocking=pin_memory)
+            bx = bx.to(device, non_blocking=pm)
             with autocast_fn():
                 logits = model(bx)
             probs = torch.sigmoid(logits).float().cpu().numpy().reshape(-1)
@@ -384,11 +279,12 @@ def _train_fold_model(
     pos_weight = torch.tensor([_compute_pos_weight(y_train)], dtype=torch.float32, device=device)
     criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    pin_memory   = _pin_memory_for(device)
-    autocast_fn, scaler = _make_amp_handles(device)
+    pm          = pin_memory_for(device)
+    autocast_fn, scaler = make_amp_context(device)
+    bs          = optimal_batch_size(device, base=cfg.model.batch_size)
 
-    loader     = _to_loader(X_train, y_train, cfg.model.batch_size, shuffle=True,  pin_memory=pin_memory)
-    val_loader = _to_loader(X_val,   y_val,   cfg.model.batch_size, shuffle=False, pin_memory=pin_memory)
+    loader     = _to_loader(X_train, y_train, bs["train"],     shuffle=True,  device=device)
+    val_loader = _to_loader(X_val,   y_val,   bs["inference"], shuffle=False, device=device)
 
     best_metric = float("-inf")
     best_state  = copy.deepcopy(model.state_dict())
@@ -406,8 +302,8 @@ def _train_fold_model(
         n_batches  = 0
 
         for bx, by in loader:
-            bx = bx.to(device, non_blocking=pin_memory)
-            by = by.to(device, non_blocking=pin_memory)
+            bx = bx.to(device, non_blocking=pm)
+            by = by.to(device, non_blocking=pm)
             optimizer.zero_grad()
 
             with autocast_fn():
@@ -431,10 +327,10 @@ def _train_fold_model(
         val_n        = 0
         val_scores: list[float] = []
 
-        with torch.no_grad():
+        with inference_context():
             for bx, by in val_loader:
-                bx = bx.to(device, non_blocking=pin_memory)
-                by = by.to(device, non_blocking=pin_memory)
+                bx = bx.to(device, non_blocking=pm)
+                by = by.to(device, non_blocking=pm)
                 with autocast_fn():
                     logits = model(bx)
                     loss   = criterion(logits, by)
@@ -502,36 +398,15 @@ def train_walk_forward(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, alp
 
     if alpha_lib and alpha_lib.formulas:
         log.info("[1/6] Computing %s alphas...", len(alpha_lib.formulas))
-        group_col_values = df["ticker"].tolist() if "ticker" in df.columns else None
-        needed_cols  = [c for c in df.columns if c not in alpha_lib.formulas]
-        feats_dict   = {col: df[col].tolist() for col in needed_cols}
-        tasks = [
-            (name, formula, feats_dict, df.index, group_col_values)
-            for name, formula in alpha_lib.formulas.items()
-            if name not in df.columns
-        ]
-        n_workers = min(max(1, len(tasks)), NUM_PHYSICAL_CORES)
-        completed = 0
-        try:
-            with ProcessPoolExecutor(max_workers=n_workers) as pool:
-                futures = {pool.submit(_compute_single_alpha, t): t[0] for t in tasks}
-                for fut in as_completed(futures):
-                    name, values, err = fut.result()
-                    completed += 1
-                    if err:
-                        log.warning("alpha %s failed (%s); filling 0.0", name, err)
-                        df[name] = 0.0
-                    else:
-                        df[name] = values
-                    if completed % 5 == 0 or completed == len(tasks):
-                        log.info("alphas done: %s/%s", completed, len(tasks))
-        except Exception as e:
-            log.warning("Parallel alpha computation unavailable (%s). Falling back to sequential.", e)
-            for task in tasks:
-                name, values, err = _compute_single_alpha(task)
-                df[name] = 0.0 if err else values
-                if err:
-                    log.warning("alpha %s failed (%s); filling 0.0", name, err)
+        from src.llm_alpha.alpha_executor import compute_alphas_on_df
+        df = compute_alphas_on_df(
+            df,
+            formulas=alpha_lib.formulas,
+            feature_names=alpha_lib.feature_names,
+            max_chars=cfg.llm_alpha.max_expr_chars,
+            max_window=cfg.llm_alpha.max_rolling_window,
+            logger=log,
+        )
 
     log.info("[2/6] Building labels and cleaning...")
     if "label" not in df.columns:
@@ -549,14 +424,11 @@ def train_walk_forward(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, alp
     log.info("[3/6] Walk-forward folds: %s", len(splits))
 
     device = get_device(cfg)
-    log.info("Training device: %s", device)
-    if device.type == "cuda":
-        log.info("  CUDA device: %s | VRAM: %.1f GB",
-                 torch.cuda.get_device_name(0),
-                 torch.cuda.get_device_properties(0).total_memory / 1e9)
+    log_device_info(device, log)
 
     oos_rows:    list[pd.DataFrame]       = []
     fold_rows:   list[dict]               = []
+    fold_models: list[tuple[nn.Module, dict]] = []  # (model, split_dict)
     final_bundle: ModelBundle | None      = None
 
     for i, sp in enumerate(splits, start=1):
@@ -596,7 +468,9 @@ def train_walk_forward(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, alp
             X_val=X_val, y_val=y_val,
             val_dates=val_dates,
         )
-        test_scores = _predict_scores(model=model, X=X_test, device=device, batch_size=1024)
+        # Compile the model for faster inference on CUDA/MPS
+        compiled_model = try_compile(model, device) if getattr(cfg.model, "torch_compile", True) else model
+        test_scores = _predict_scores(model=compiled_model, X=X_test, device=device)
         test_top1   = _daily_topk_precision(test_dates, test_scores, y_test, k=1)
         test_top2   = _daily_topk_precision(test_dates, test_scores, y_test, k=2)
 
@@ -622,14 +496,26 @@ def train_walk_forward(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, alp
 
         model = model.cpu()
         model.eval()
-        final_bundle = ModelBundle(
-            model=model, scaler=scaler,
-            feature_cols=feature_cols, lookback=lookback,
-            signal_timing=cfg.execution.signal_timing,
-        )
+        fold_models.append((model, sp))
 
-    if final_bundle is None:
+    if not fold_models:
         raise RuntimeError("All walk-forward folds were skipped; model was not trained.")
+
+    # Use the last fold's model as the production model, but fit the scaler
+    # on ALL training data up to and including the last fold's train period
+    # to avoid the scaler mismatch that caused 0-trade backtests.
+    last_model, last_split = fold_models[-1]
+    cumulative_train_mask = df["date"] <= last_split["train_end"]
+    cumulative_scaler = StandardScaler()
+    cumulative_scaler.fit(df.loc[cumulative_train_mask, feature_cols])
+
+    final_bundle = ModelBundle(
+        model=last_model, scaler=cumulative_scaler,
+        feature_cols=feature_cols, lookback=lookback,
+        signal_timing=cfg.execution.signal_timing,
+    )
+    # Attach fold models for potential ensemble use
+    final_bundle.fold_models = [(m.state_dict(), sp) for m, sp in fold_models]
 
     log.info("[5/6] Saving model and OOS calibration artifacts...")
     model_path = paths.model_bundle_path()

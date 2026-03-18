@@ -1,5 +1,6 @@
 """Random-seed utilities for reproducible model training runs."""
 
+import os
 import random
 
 import numpy as np
@@ -14,5 +15,14 @@ def seed_everything(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)  # for multi-GPU
-    elif torch.backends.mps.is_available():
-        torch.mps.manual_seed(seed)  # type: ignore[attr-defined]
+        # Deterministic ops at the cost of a small perf hit;
+        # comment out if speed matters more than exact reproducibility.
+        torch.backends.cudnn.deterministic = False  # False = faster (benchmark mode)
+    # MPS seed is only available in PyTorch ≥ 2.1
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        try:
+            torch.mps.manual_seed(seed)
+        except (AttributeError, RuntimeError):
+            pass
+    # Ensure hash-based operations are deterministic across workers
+    os.environ.setdefault("PYTHONHASHSEED", str(seed))

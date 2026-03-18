@@ -11,6 +11,17 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 from src.core.config import AppConfig, pct_to_fraction
+from src.core.device import (
+    inference_context,
+    log_device_info,
+    make_amp_context,
+    optimal_batch_size,
+    optimal_num_workers,
+    pin_memory_for,
+    resolve_device,
+    try_compile,
+    tune_for_device,
+)
 from src.core.paths import RunPaths
 from src.models.calibration import apply_calibration
 from src.models.windowing import build_inference_windows
@@ -95,100 +106,19 @@ def generate_daily_signals(
     latest_df = df[df["date"].isin(latest_dates)].copy().reset_index(drop=True)
 
     # ---------------------------------------------------------------
-    # 3) Compute LLM alphas dynamically on latest_df
+    # 3) Compute LLM alphas dynamically using canonical safe executor
     # ---------------------------------------------------------------
     if alpha_lib and hasattr(alpha_lib, "formulas") and alpha_lib.formulas:
         log.info("Computing LLM alphas dynamically for inference...")
-
-        def to_series(x):
-            """Re-wrap a numpy array as a Series aligned to latest_df."""
-            if isinstance(x, np.ndarray):
-                return pd.Series(x, index=latest_df.index)
-            return x
-
-        def apply_grouped(s, func):
-            s = to_series(s)
-            return s.groupby(latest_df["ticker"]).transform(func)
-
-        def safe_div(x, y):
-            x, y = to_series(x), to_series(y)
-            return np.where(y == 0, 0.0, x / y)
-
-        def zscore(x, w):
-            x = to_series(x)
-            mean = apply_grouped(x, lambda s: s.rolling(w).mean())
-            std  = apply_grouped(x, lambda s: s.rolling(w).std())
-            return (x - mean) / np.where(std == 0, 1e-9, std)
-
-        def delta(x, p):
-            return apply_grouped(x, lambda s: s.diff(p))
-
-        def rolling_mean(x, w):
-            return apply_grouped(x, lambda s: s.rolling(w).mean())
-
-        def rolling_std(x, w):
-            return apply_grouped(x, lambda s: s.rolling(w).std())
-
-        def rolling_min(x, w):
-            return apply_grouped(x, lambda s: s.rolling(w).min())
-
-        def rolling_max(x, w):
-            return apply_grouped(x, lambda s: s.rolling(w).max())
-
-        def sign(x):
-            return np.sign(to_series(x))
-
-        def clip(x, lower, upper):
-            return np.clip(to_series(x), lower, upper)
-
-        def log1p(x):
-            return np.log1p(to_series(x))
-
-        def shift(x, d):
-            return apply_grouped(x, lambda s: s.shift(d))
-
-        def ewm_mean(x, span):
-            return apply_grouped(x, lambda s: s.ewm(span=span).mean())
-
-        eval_globals = {
-            "safe_div":    safe_div,
-            "zscore":      zscore,
-            "delta":       delta,
-            "rolling_mean": rolling_mean,
-            "rolling_std": rolling_std,
-            "rolling_min": rolling_min,
-            "rolling_max": rolling_max,
-            "sign":        sign,
-            "abs":         abs,
-            "np":          np,
-            "clip":        clip,
-            "log1p":       log1p,
-            "shift":       shift,
-            "ewm_mean":    ewm_mean,
-        }
-
-        for alpha_name, formula in alpha_lib.formulas.items():
-            if alpha_name in latest_df.columns:
-                continue
-
-            eval_locals = {
-                col: latest_df[col]
-                for col in latest_df.columns
-                if col not in ("ticker", "date")
-            }
-
-            for canonical in ("Open", "High", "Low", "Close", "Volume"):
-                if canonical in latest_df.columns:
-                    eval_locals[canonical] = latest_df[canonical]
-
-            try:
-                result = eval(formula, eval_globals, eval_locals)
-                latest_df[alpha_name] = to_series(result).values
-            except Exception as e:
-                log.warning(
-                    f"Alpha {alpha_name} failed to compute: {e}. Filling with 0.0"
-                )
-                latest_df[alpha_name] = 0.0
+        from src.llm_alpha.alpha_executor import compute_alphas_on_df
+        latest_df = compute_alphas_on_df(
+            latest_df,
+            formulas=alpha_lib.formulas,
+            feature_names=alpha_lib.feature_names,
+            max_chars=200,
+            max_window=60,
+            logger=log,
+        )
 
     # ---------------------------------------------------------------
     # 4) Drop NAs, scale, build ONE window per ticker (tail=lookback)
@@ -247,30 +177,44 @@ def generate_daily_signals(
         )
 
     X  = torch.tensor(np.stack(windows), dtype=torch.float32)
-    ds = TensorDataset(X, torch.zeros((X.shape[0], 1), dtype=torch.float32))
-    loader = DataLoader(ds, batch_size=cfg.model.batch_size, shuffle=False)
+    ds = TensorDataset(X)
 
     # ---------------------------------------------------------------
-    # 5) Inference
-    # ── FIXED: prefer CUDA (Kaggle/cloud), fall back to MPS (Mac), then CPU ──
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif cfg.model.use_mps_if_available and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    # ────────────────────────────────────────────────────────────────────────
-    log.info("Inference device: %s", device)
+    # 5) Inference with optimal device + AMP
+    device = resolve_device(
+        prefer_cuda=getattr(cfg.model, "use_cuda_if_available", True),
+        prefer_mps=getattr(cfg.model, "use_mps_if_available", True),
+    )
+    tune_for_device(device)
+    log_device_info(device, log)
 
-    model = model.to(device)
+    bs = optimal_batch_size(device)["inference"]
+    pm = pin_memory_for(device)
+    nw = optimal_num_workers(device)
+    autocast_fn, _ = make_amp_context(device)
+
+    loader = DataLoader(
+        ds,
+        batch_size=bs,
+        shuffle=False,
+        num_workers=nw,
+        pin_memory=pm,
+        persistent_workers=(nw > 0),
+    )
+
+    if getattr(cfg.model, "torch_compile", True):
+        model = try_compile(model.to(device), device)
+    else:
+        model = model.to(device)
     model.eval()
 
     preds = []
-    with torch.no_grad():
-        for bx, _ in loader:
-            bx = bx.to(device)
-            out  = model(bx)
-            probs = torch.sigmoid(out).detach().cpu().numpy().reshape(-1)
+    with inference_context():
+        for (bx,) in loader:
+            bx = bx.to(device, non_blocking=pm)
+            with autocast_fn():
+                out = model(bx)
+            probs = torch.sigmoid(out).float().cpu().numpy().reshape(-1)
             preds.extend(probs.tolist())
 
     calibration = paths.load_model_calibration()

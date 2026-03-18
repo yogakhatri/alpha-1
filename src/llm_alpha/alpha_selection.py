@@ -239,12 +239,21 @@ def _validate_and_select(
 
     Selection objective:
     weighted daily top-1 / top-2 precision on the barrier label.
+
+    To avoid in-sample leakage, alpha selection uses only the first 70% of
+    available dates. The remaining 30% is reserved for walk-forward OOS testing.
     """
-    # Select alphas by barrier-label ranking quality (top-1/top-2 precision by day),
-    # aligned to the actual swing objective.
     df = feats.sort_values(["ticker", "date"]).copy()
     if "label" not in df.columns:
         df = add_label_column_barrier(cfg, df)
+
+    # Prevent leakage: only use first 70% of dates for alpha selection
+    unique_dates = np.sort(df["date"].unique())
+    cutoff_idx = int(len(unique_dates) * 0.7)
+    cutoff_date = unique_dates[cutoff_idx]
+    df = df[df["date"] <= cutoff_date].copy()
+    log.info("Alpha selection using dates up to %s (%d/%d dates, 70%% split)",
+             pd.Timestamp(cutoff_date).date(), cutoff_idx, len(unique_dates))
 
     def daily_topk_precision(tmp: pd.DataFrame, score_col: str, k: int, ascending: bool = False) -> float:
         x = tmp.sort_values(["date", score_col], ascending=[True, ascending]).groupby("date", as_index=False).head(k)

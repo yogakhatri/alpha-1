@@ -133,7 +133,7 @@ class RunPaths:
         This file is overwritten each run and is useful for dashboards that
         always read a fixed filename.
         """
-        return self.runs / "signals" / "signals_top_10.csv"
+        return self.runs / "signals" / "signals_latest.csv"
 
     def signals_csv_path_for_date(self, signal_date: pd.Timestamp | str) -> Path:
         """Date-specific signals filename.

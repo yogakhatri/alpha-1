@@ -68,3 +68,48 @@ def compute_alpha(
 
     s = s.replace([np.inf, -np.inf], np.nan)
     return s.astype(float)
+
+
+def compute_alphas_on_df(
+    df: pd.DataFrame,
+    formulas: dict[str, str],
+    feature_names: list[str],
+    max_chars: int = 200,
+    max_window: int | None = 60,
+    logger=None,
+) -> pd.DataFrame:
+    """Compute all alpha expressions on a DataFrame, grouped by ticker.
+
+    This is the single canonical entry-point used by training, backtest,
+    and signal generation. Each alpha is evaluated per-ticker so that
+    rolling windows never cross ticker boundaries, using the same safe
+    executor (builtins suppressed, AST-validated) as alpha selection.
+
+    Args:
+        df: Must have columns 'ticker', 'date', and all feature_names.
+            Should be sorted by ['ticker', 'date'].
+        formulas: {alpha_name: expression_string} from alpha library.
+        feature_names: Base feature column names available in df.
+        max_chars: Max expression length for validation.
+        max_window: Max rolling window size for validation.
+        logger: Optional logger for warnings.
+
+    Returns:
+        df with new alpha columns added in-place.
+    """
+    for alpha_name, formula in formulas.items():
+        if alpha_name in df.columns:
+            continue
+        try:
+            s = df.groupby("ticker", group_keys=False).apply(
+                lambda g: compute_alpha(g, formula, feature_names, max_chars, max_window)
+            )
+            # Realign index after groupby apply
+            if isinstance(s.index, pd.MultiIndex):
+                s = s.reset_index(level=0, drop=True)
+            df[alpha_name] = s.reindex(df.index)
+        except Exception as e:
+            if logger:
+                logger.warning("Alpha %s failed (%s); filling with 0.0", alpha_name, e)
+            df[alpha_name] = 0.0
+    return df

@@ -4,14 +4,27 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+from src.core.device import (
+    inference_context,
+    make_amp_context,
+    optimal_batch_size,
+    optimal_num_workers,
+    pin_memory_for,
+    resolve_device,
+    tune_for_device,
+)
+
 
 def predict_proba(model_bundle, X: np.ndarray, use_mps: bool = True) -> np.ndarray:
-    """Predict probabilities for a prebuilt window dataset object.
+    """Predict probabilities for a prebuilt numpy window array.
 
-    Note:
-        This helper expects `X` to behave like the project window dataset
-        (it reuses `dataset.data_arr`). The main production path currently uses
-        direct inference in training/backtest/signal modules.
+    Args:
+        model_bundle: ModelBundle with .model and .scaler attributes.
+        X: numpy array of shape (B, seq_len, num_feats).
+        use_mps: Whether to use MPS (Apple Silicon) if available.
+
+    Returns:
+        np.ndarray of predicted probabilities, shape (B,).
     """
     model = model_bundle.model
     scaler = model_bundle.scaler
@@ -23,40 +36,40 @@ def predict_proba(model_bundle, X: np.ndarray, use_mps: bool = True) -> np.ndarr
     X_scaled = X_scaled.reshape(B, seq_len, num_feats)
 
     # 2. Setup Device
-    # ── FIXED: prefer CUDA (Kaggle/cloud), fall back to MPS (Mac), then CPU ──
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif use_mps and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    # ─────────────────────────────────────────────────────────────────────────
+    device = resolve_device(prefer_cuda=True, prefer_mps=use_mps)
+    tune_for_device(device)
 
     model.to(device)
     model.eval()
 
-    # 3. Create a DataLoader to batch the predictions and avoid OOM
-    dataset = X
+    # 3. Create a DataLoader from the scaled numpy array
+    X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+    dataset = TensorDataset(X_tensor)
 
-    # Re-inject the scaled data back into the dataset before predicting
-    dataset.data_arr = X_scaled
+    bs = optimal_batch_size(device)["inference"]
+    pm = pin_memory_for(device)
+    nw = optimal_num_workers(device)
+    autocast_fn, _ = make_amp_context(device)
 
-    # Larger batch size for CUDA; keep small for MPS to prevent memory spikes
-    batch_size = 512 if device.type == "cuda" else 64
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=bs,
+        shuffle=False,
+        num_workers=nw,
+        pin_memory=pm,
+        persistent_workers=(nw > 0),
+    )
 
     all_probs = []
 
-    # 4. Run inference in batches
-    with torch.no_grad():
-        for batch in dataloader:
-            xb = batch[0].to(device)
-            logit = model(xb).detach().cpu().numpy()
+    # 4. Run inference in batches with AMP + inference_mode
+    with inference_context():
+        for (batch,) in dataloader:
+            xb = batch.to(device, non_blocking=pm)
+            with autocast_fn():
+                logit = model(xb)
+            prob = torch.sigmoid(logit).float().cpu().numpy().squeeze(-1)
 
-            # Convert logits to probabilities using sigmoid
-            prob = 1.0 / (1.0 + np.exp(-logit.squeeze(-1)))
-
-            # If the output is a scalar (batch size 1), make it a list
             if prob.ndim == 0:
                 all_probs.append(prob.item())
             else:

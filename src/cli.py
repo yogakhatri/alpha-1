@@ -165,6 +165,10 @@ def build_parser() -> argparse.ArgumentParser:
     """Construct CLI parser with all supported pipeline commands."""
     p = argparse.ArgumentParser(prog="nse-swing")
     p.add_argument("--config", required=True)
+    p.add_argument("--force-rerun", action="store_true",
+                   help="Delete cached artifacts and rerun from scratch")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Print what would be done without executing")
     sp = p.add_subparsers(dest="cmd", required=True)
 
     sp.add_parser("download-data")
@@ -176,10 +180,39 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _handle_force_rerun(cmd: str, paths: RunPaths) -> None:
+    """Remove cached artifacts for a given command stage."""
+    import shutil
+    removals = {
+        "download-data": [paths.raw / "bhavcopy", paths.raw / "yfinance", paths.processed_ohlcv_path()],
+        "build-features": [paths.features_path()],
+        "generate-alphas": [paths.alpha_library_path(), paths.runs / "alpha_cache" / "alpha_response.json"],
+        "train": [paths.model_bundle_path(), paths.model_calibration_path(), paths.oos_predictions_path()],
+        "backtest": [paths.runs / "reports" / "backtest_stats.csv", paths.runs / "reports" / "equity_curve.png"],
+        "daily-signals": [],  # signals are always regenerated
+    }
+    for target in removals.get(cmd, []):
+        if target.exists():
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+            log.info("Force-rerun: removed %s", target)
+
+
 def main() -> None:
     """Parse arguments and dispatch to the selected command handler."""
     p = build_parser()
     args = p.parse_args()
+
+    if args.dry_run:
+        log.info("DRY RUN: would execute '%s' with config=%s", args.cmd, args.config)
+        return
+
+    if args.force_rerun:
+        cfg = load_config(args.config)
+        paths = RunPaths.from_config(cfg)
+        _handle_force_rerun(args.cmd, paths)
 
     if args.cmd == "download-data":
         cmd_download_data(args.config)

@@ -12,13 +12,13 @@ def assert_non_empty(df: pd.DataFrame, dataset_name: str) -> None:
 
 
 def latest_trading_day_lag(latest_date: pd.Timestamp, cfg_end_date: str) -> int:
-    """Compute business-day gap between latest available row and config end date."""
+    """Compute approximate NSE trading-day gap between latest row and config end date."""
+    from src.core.calendar import nse_business_day_count
     end = pd.Timestamp(cfg_end_date).normalize()
     latest = pd.Timestamp(latest_date).normalize()
     if latest >= end:
         return 0
-    missing = pd.bdate_range(start=latest + pd.offsets.BDay(1), end=end)
-    return int(len(missing))
+    return nse_business_day_count(latest, end)
 
 
 def assert_fresh_enough(

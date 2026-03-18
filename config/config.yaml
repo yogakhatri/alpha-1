@@ -10,7 +10,7 @@ universe:
 
 data:
   start_date: "2018-01-01"
-  end_date: "2026-03-09"
+  end_date: "today"  # Automatically uses current date
   use_bhavcopy: true
   use_yfinance_fallback: true
   max_stale_trading_days: 5
@@ -49,6 +49,7 @@ model:
   early_stop_patience: 7           # Forgiving early stop for volatile datasets
   use_cuda_if_available: true       # Check CUDA (Nvidia GPU) first
   use_mps_if_available: true
+  torch_compile: true               # torch.compile for PyTorch 2+ (CUDA/MPS)
 
 backtest:
   walk_forward:
@@ -62,7 +63,7 @@ execution:
   signal_timing: "EOD_NEXT_OPEN"
 
 decision:
-  max_picks_per_day: 2
+  max_picks_per_day: 5
   min_score_threshold: 0.0
   min_calibrated_prob: 0.0
   min_expected_value_pct: 0.0

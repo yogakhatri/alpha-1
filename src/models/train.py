@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -10,6 +12,8 @@ import torch
 import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
+
+_N_WORKERS = max(1, os.cpu_count() or 1)
 
 from src.backtest.simulator import add_label_column_barrier
 from src.core.config import AppConfig
@@ -111,45 +115,89 @@ def _build_labeled_windows(
     start_date: pd.Timestamp,
     end_date: pd.Timestamp,
 ) -> tuple[np.ndarray, np.ndarray, list[str], list[pd.Timestamp]]:
-    """Build supervised windows for a date range using selected timing mode."""
-    windows: list[np.ndarray] = []
-    labels:  list[float]      = []
-    tickers: list[str]        = []
-    dates:   list[pd.Timestamp] = []
+    """Build supervised windows for a date range using selected timing mode.
 
-    for tkr, g in df.groupby("ticker", sort=False):
+    Uses numpy sliding_window_view for vectorized window extraction per ticker,
+    parallelized across tickers with ThreadPoolExecutor.
+    """
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    def _process_ticker(tkr_and_group):
+        tkr, g = tkr_and_group
         g   = g.sort_values("date")
         arr = g[feature_cols].to_numpy(dtype=np.float32)
         y   = g["label"].to_numpy(dtype=np.float32)
         d   = pd.to_datetime(g["date"]).to_numpy()
         n   = len(g)
 
-        if signal_timing == "PREOPEN_SAME_DAY":
-            for i in range(lookback, n):
-                dt = pd.Timestamp(d[i])
-                if dt < start_date or dt > end_date:
-                    continue
-                if np.isnan(y[i]):
-                    continue
-                x = arr[i - lookback : i]
-                if np.isnan(x).any():
-                    continue
-                windows.append(x); labels.append(float(y[i]))
-                tickers.append(tkr); dates.append(dt)
-            continue
+        if n < lookback:
+            return [], [], [], []
 
-        # EOD_NEXT_OPEN
-        for i in range(max(lookback - 1, 0), n):
-            dt = pd.Timestamp(d[i])
-            if dt < start_date or dt > end_date:
-                continue
-            if np.isnan(y[i]):
-                continue
-            x = arr[i - lookback + 1 : i + 1]
-            if np.isnan(x).any():
-                continue
-            windows.append(x); labels.append(float(y[i]))
-            tickers.append(tkr); dates.append(dt)
+        # Build all possible windows using stride tricks (zero-copy)
+        if signal_timing == "PREOPEN_SAME_DAY":
+            # Window [i-lookback : i] for label at i, so i starts at lookback
+            if n <= lookback:
+                return [], [], [], []
+            # candidate indices: lookback..n-1
+            cand_idx = np.arange(lookback, n)
+            # Windows: for each i, window is arr[i-lookback:i] (lookback rows)
+            all_windows = sliding_window_view(arr, (lookback, arr.shape[1])).reshape(-1, lookback, arr.shape[1])
+            # sliding_window_view over axis 0 gives windows starting at 0,1,...
+            # window at position j = arr[j:j+lookback], so for candidate i we need j=i-lookback
+            win_idx = cand_idx - lookback  # maps candidate i -> window starting at i-lookback
+        else:
+            # EOD_NEXT_OPEN: window [i-lookback+1 : i+1] for label at i
+            cand_idx = np.arange(max(lookback - 1, 0), n)
+            all_windows = sliding_window_view(arr, (lookback, arr.shape[1])).reshape(-1, lookback, arr.shape[1])
+            # window at position j = arr[j:j+lookback], candidate i needs j=i-lookback+1
+            win_idx = cand_idx - lookback + 1
+
+        # Filter by date range
+        dates_cand = d[cand_idx]
+        ts_start = np.datetime64(start_date)
+        ts_end = np.datetime64(end_date)
+        date_mask = (dates_cand >= ts_start) & (dates_cand <= ts_end)
+
+        # Filter by valid label
+        labels_cand = y[cand_idx]
+        label_mask = ~np.isnan(labels_cand)
+
+        valid = date_mask & label_mask
+        if not np.any(valid):
+            return [], [], [], []
+
+        vi = np.where(valid)[0]
+        sel_win_idx = win_idx[vi]
+        sel_labels = labels_cand[vi]
+        sel_dates = dates_cand[vi]
+
+        # Extract windows and filter out any with NaN
+        wins = all_windows[sel_win_idx]  # (K, lookback, features)
+        nan_mask = ~np.isnan(wins).any(axis=(1, 2))
+
+        if not np.any(nan_mask):
+            return [], [], [], []
+
+        wins = wins[nan_mask]
+        sel_labels = sel_labels[nan_mask]
+        sel_dates = sel_dates[nan_mask]
+
+        tkrs = [tkr] * len(wins)
+        dts = [pd.Timestamp(dt) for dt in sel_dates]
+        return list(wins), sel_labels.tolist(), tkrs, dts
+
+    groups = list(df.groupby("ticker", sort=False))
+    windows: list[np.ndarray] = []
+    labels:  list[float]      = []
+    tickers: list[str]        = []
+    dates:   list[pd.Timestamp] = []
+
+    with ThreadPoolExecutor(max_workers=_N_WORKERS) as pool:
+        for wins, labs, tkrs, dts in pool.map(_process_ticker, groups):
+            windows.extend(wins)
+            labels.extend(labs)
+            tickers.extend(tkrs)
+            dates.extend(dts)
 
     if not windows:
         return (
@@ -215,7 +263,7 @@ def _predict_scores(
         pin_memory=pm,
         persistent_workers=(nw > 0),
     )
-    out: list[float] = []
+    out: list[np.ndarray] = []
     model.eval()
     with inference_context():
         for (bx,) in loader:
@@ -223,8 +271,8 @@ def _predict_scores(
             with autocast_fn():
                 logits = model(bx)
             probs = torch.sigmoid(logits).float().cpu().numpy().reshape(-1)
-            out.extend(probs.tolist())
-    return np.asarray(out, dtype=np.float32)
+            out.append(probs)
+    return np.concatenate(out) if out else np.empty((0,), dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +352,7 @@ def _train_fold_model(
         for bx, by in loader:
             bx = bx.to(device, non_blocking=pm)
             by = by.to(device, non_blocking=pm)
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             with autocast_fn():
                 logits = model(bx)
@@ -325,7 +373,7 @@ def _train_fold_model(
         model.eval()
         val_loss_sum = 0.0
         val_n        = 0
-        val_scores: list[float] = []
+        val_score_parts: list[np.ndarray] = []
 
         with inference_context():
             for bx, by in val_loader:
@@ -334,15 +382,16 @@ def _train_fold_model(
                 with autocast_fn():
                     logits = model(bx)
                     loss   = criterion(logits, by)
-                bs = int(by.shape[0])
-                val_loss_sum += float(loss.item()) * bs
-                val_n        += bs
-                val_scores.extend(
-                    torch.sigmoid(logits).float().cpu().numpy().reshape(-1).tolist()
+                bsz = int(by.shape[0])
+                val_loss_sum += float(loss.item()) * bsz
+                val_n        += bsz
+                val_score_parts.append(
+                    torch.sigmoid(logits).float().cpu().numpy().reshape(-1)
                 )
 
         val_loss = (val_loss_sum / max(1, val_n)) if val_n > 0 else float("inf")
-        val_top1 = _daily_topk_precision(val_dates, np.asarray(val_scores), y_val, k=1)
+        val_scores = np.concatenate(val_score_parts) if val_score_parts else np.empty(0)
+        val_top1 = _daily_topk_precision(val_dates, val_scores, y_val, k=1)
 
         metric = val_top1 - 0.05 * val_loss
         if metric > best_metric + 1e-8:
@@ -447,8 +496,10 @@ def train_walk_forward(cfg: AppConfig, paths: RunPaths, feats: pd.DataFrame, alp
 
         scaler = StandardScaler()
         scaler.fit(df.loc[train_mask, feature_cols])
-        sdf = df.copy()
-        sdf[feature_cols] = scaler.transform(sdf[feature_cols])
+        # Scale only the feature columns on the full df (avoid copying entire df)
+        scaled_features = scaler.transform(df[feature_cols].to_numpy())
+        sdf = df[["ticker", "date", "label"]].copy()
+        sdf[feature_cols] = scaled_features
 
         X_train, y_train, _, _           = _build_labeled_windows(sdf, feature_cols, lookback, cfg.execution.signal_timing, sp["train_start"], sp["train_end"])
         X_val,   y_val,   _, val_dates   = _build_labeled_windows(sdf, feature_cols, lookback, cfg.execution.signal_timing, sp["val_start"],   sp["val_end"])

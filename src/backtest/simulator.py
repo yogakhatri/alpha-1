@@ -2,10 +2,15 @@ from __future__ import annotations
 
 """Barrier-label construction for supervised training/backtest alignment."""
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import pandas as pd
 
 from src.core.config import AppConfig, pct_to_fraction
+
+_N_WORKERS = max(1, os.cpu_count() or 1)
 
 
 def add_label_column_barrier(cfg: AppConfig, df: pd.DataFrame) -> pd.DataFrame:
@@ -26,11 +31,11 @@ def add_label_column_barrier(cfg: AppConfig, df: pd.DataFrame) -> pd.DataFrame:
 
     labels = np.full(len(g), np.nan, dtype=float)
 
-    for _, grp in g.groupby("ticker", sort=False):
+    def _label_one_ticker(grp):
         idx = grp.index.to_numpy()
         n = len(grp)
         if n == 0:
-            continue
+            return idx, np.array([], dtype=float), np.array([], dtype=bool)
 
         op = grp["Open"].to_numpy(dtype=float)
         hi = grp["High"].to_numpy(dtype=float)
@@ -43,7 +48,7 @@ def add_label_column_barrier(cfg: AppConfig, df: pd.DataFrame) -> pd.DataFrame:
         stop = entry * (1.0 - sl_pct)
 
         resolved = np.zeros(n, dtype=bool)
-        out = np.zeros(n, dtype=float)  # default unresolved-valid outcome is stop/timeout => 0.0
+        out = np.zeros(n, dtype=float)
 
         for day in range(1, horizon + 1):
             op_d = np.full(n, np.nan, dtype=float)
@@ -74,7 +79,13 @@ def add_label_column_barrier(cfg: AppConfig, df: pd.DataFrame) -> pd.DataFrame:
             out[do_target] = 1.0
             resolved |= do_stop | do_target
 
-        labels[idx[valid]] = out[valid]
+        return idx, out, valid
+
+    ticker_groups = [grp for _, grp in g.groupby("ticker", sort=False)]
+    with ThreadPoolExecutor(max_workers=_N_WORKERS) as pool:
+        for idx, out, valid in pool.map(_label_one_ticker, ticker_groups):
+            if len(idx) > 0:
+                labels[idx[valid]] = out[valid]
 
     g["label"] = labels
     return g

@@ -3,12 +3,16 @@ from __future__ import annotations
 """Safe alpha expression executor on pandas dataframes."""
 
 import ast
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 
 import numpy as np
 import pandas as pd
 
 from src.llm_alpha.alpha_parser import validate_expression
+
+_N_WORKERS = max(1, os.cpu_count() or 1)
 
 
 def _safe_div(a: pd.Series, b: pd.Series, eps: float = 1e-12) -> pd.Series:
@@ -97,19 +101,27 @@ def compute_alphas_on_df(
     Returns:
         df with new alpha columns added in-place.
     """
-    for alpha_name, formula in formulas.items():
-        if alpha_name in df.columns:
-            continue
+    def _compute_one(alpha_name: str, formula: str) -> tuple[str, pd.Series | None, str | None]:
+        """Compute a single alpha; returns (name, series_or_None, error_or_None)."""
         try:
             s = df.groupby("ticker", group_keys=False).apply(
                 lambda g: compute_alpha(g, formula, feature_names, max_chars, max_window)
             )
-            # Realign index after groupby apply
             if isinstance(s.index, pd.MultiIndex):
                 s = s.reset_index(level=0, drop=True)
-            df[alpha_name] = s.reindex(df.index)
+            return alpha_name, s.reindex(df.index), None
         except Exception as e:
-            if logger:
-                logger.warning("Alpha %s failed (%s); filling with 0.0", alpha_name, e)
-            df[alpha_name] = 0.0
+            return alpha_name, None, str(e)
+
+    pending = {k: v for k, v in formulas.items() if k not in df.columns}
+    with ThreadPoolExecutor(max_workers=_N_WORKERS) as pool:
+        futures = {pool.submit(_compute_one, k, v): k for k, v in pending.items()}
+        for fut in as_completed(futures):
+            alpha_name, series, err = fut.result()
+            if err is not None:
+                if logger:
+                    logger.warning("Alpha %s failed (%s); filling with 0.0", alpha_name, err)
+                df[alpha_name] = 0.0
+            else:
+                df[alpha_name] = series
     return df

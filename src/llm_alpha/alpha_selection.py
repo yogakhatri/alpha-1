@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,8 @@ import requests
 from src.core.config import AppConfig
 from src.core.logging import get_logger
 from src.core.paths import RunPaths
+
+_N_WORKERS = max(1, os.cpu_count() or 1)
 from src.backtest.simulator import add_label_column_barrier
 from src.llm_alpha.alpha_executor import compute_alpha
 from src.llm_alpha.alpha_whitelist import AlphaLibrary
@@ -262,9 +265,11 @@ def _validate_and_select(
         return float(x["y"].mean())
 
     candidates = []
-    for name, expr in llm_obj.items():
+
+    def _score_one(name: str, expr: str):
+        """Score one candidate alpha; returns (metric, name, expr) or None."""
         if not isinstance(expr, str):
-            continue
+            return None
         try:
             s = df.groupby("ticker", group_keys=False).apply(
                 lambda g: compute_alpha(
@@ -278,7 +283,7 @@ def _validate_and_select(
             s = s.reset_index(level=0, drop=True)
             tmp = pd.DataFrame({"date": pd.to_datetime(df["date"]), "a": s, "y": df["label"]}).dropna()
             if len(tmp) < 3000 or tmp["date"].nunique() < 120:
-                continue
+                return None
 
             top1_long = daily_topk_precision(tmp, "a", k=1, ascending=False)
             top2_long = daily_topk_precision(tmp, "a", k=2, ascending=False)
@@ -296,10 +301,17 @@ def _validate_and_select(
                 metric = metric_long
 
             if np.isnan(metric):
-                continue
-            candidates.append((float(metric), name, oriented_expr))
+                return None
+            return (float(metric), name, oriented_expr)
         except Exception:
-            continue
+            return None
+
+    with ThreadPoolExecutor(max_workers=_N_WORKERS) as pool:
+        futures = {pool.submit(_score_one, name, expr): name for name, expr in llm_obj.items()}
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result is not None:
+                candidates.append(result)
 
     log.info("Alpha candidates accepted after validation/scoring: %s", len(candidates))
     candidates.sort(reverse=True, key=lambda x: x[0])
